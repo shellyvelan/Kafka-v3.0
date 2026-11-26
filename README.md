@@ -16,13 +16,16 @@ A greenfield, 3-rack KRaft Kafka cluster running as `systemd` services on 17 VMs
 | Brokers | 9 dedicated brokers, 3 per rack, rack-aware placement. |
 | Connect VMs | **3 dedicated VMs, one per rack**, hosting Connect + all ecosystem services. |
 | REST Proxy | 2 instances (`connect-2`, `connect-3`). Clients use one hostname; failover is a manual DNS repoint. |
-| Monitoring | `danielqsj/kafka_exporter` **v1.9.0** ×2 + **Prometheus** ×2 on `connect-2`/`connect-3`. Existing Grafana connects to them. |
-| Kafbat UI | Runs in **Kubernetes** (Deployment, `replicas: 1`); k8s reschedules it on failure. Not on the VMs. |
+| Monitoring | `danielqsj/kafka_exporter` **v1.9.0** ×2 + **Prometheus** ×2 on `connect-2`/`connect-3`. Existing Grafana connects to them. The exporter comes from the image already on site, not from the bundle. |
+| Kafbat UI | Runs in **Kubernetes**, deployed by you from the image already on site. This repo only issues its client cert and ACLs. |
+| Listeners | Brokers: **`INTERNAL` 9092** (inter-broker + all VM-side clients) and **`EXTERNAL` 29092** (k8s clients). Controllers 9093, Connect 8083, REST 8082, exporter 9308. |
 | Auth | **mTLS only** (`ssl.client.auth=required`), principals from cert CN, `StandardAuthorizer` ACLs. |
 | Certificates | Self-signed cluster CA, **per-host keystores**. |
 | Cross-zone ops | RHEL ↔ Ubuntu SSH is blocked; a hardened **`rhel-agent`** (fixed actions only) on `ctrl-1` executes Rack 1 operations. |
 | Ops node | **`ctrl-2`** (main) and **`ctrl-4`** (secondary), kept in sync with `ops-sync.sh`. |
-| Config generation | `inventory.conf` + `envsubst` templates (pure bash, no Ansible). |
+| Config generation | `inventory.conf` + `envsubst` templates (pure bash, no Ansible). The inventory is the single source of truth for who talks to whom (§2.4). |
+| Service accounts | System user `kafka` runs every Kafka/ecosystem unit; `kafka-agent` runs the agent (§5.4). |
+| systemd | One unit per service, `enabled` at boot, `Restart=on-failure` with a limit of 3 tries per 10 min (§5.4). |
 | Storage | Every VM has a single 100 GB `/data` disk: Kafka data in `/data/kafka`, logs in `/data/log/kafka`. |
 | Retention | Default **72 h** plus a per-topic `retention.bytes` cap. |
 
@@ -44,15 +47,30 @@ Controller VMs run no service other than `kafka-controller`, except `rhel-agent`
 
 SELinux is enforcing on the RHEL rack.
 
-Off-VM: **Kafbat UI** (Kubernetes), **Grafana** (existing), **MongoDB** (existing), **log service** (Kubernetes, REST Proxy client).
+Off-VM (all existing, not managed by this repo): **Kafbat UI** (k8s), **k8s apps** (native clients on 29092), **log service** (k8s, REST Proxy client), **Grafana**, **MongoDB**.
 
 ### 2.2 Node IDs and listeners
 
 | Role | `node.id` | Listeners | Port |
 | :--- | :--- | :--- | :--- |
 | Controllers `ctrl-1..5` | `1..5` | `CONTROLLER` (mTLS) | 9093 |
-| Brokers `broker-1..9` | `101..109` | `INTERNAL` (mTLS, inter-broker) | 9092 |
-| | | `CLIENT` (mTLS, apps, Connect, REST, k8s) | 9094 |
+| Brokers `broker-1..9` | `101..109` | `INTERNAL` (mTLS): inter-broker **and** VM-side clients (Connect, REST, exporter, ops scripts) | 9092 |
+| | | `EXTERNAL` (mTLS): clients in **k8s** (apps, Kafbat UI) | 29092 |
+| Connect workers | — | REST API (HTTPS) | 8083 |
+| REST Proxy | — | HTTP API | 8082 |
+| kafka_exporter | — | `/metrics` | 9308 |
+| Prometheus | — | HTTP | 9090 |
+| `rhel-agent` | — | HTTPS API | 6000 |
+
+Broker listener config (rendered per broker from the inventory):
+```properties
+listeners=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+advertised.listeners=INTERNAL://broker-4.<domain>:9092,EXTERNAL://${EXTERNAL_HOST}:29092
+listener.security.protocol.map=INTERNAL:SSL,EXTERNAL:SSL,CONTROLLER:SSL
+inter.broker.listener.name=INTERNAL
+controller.listener.names=CONTROLLER
+```
+`EXTERNAL_HOST` is the broker's FQDN by default. **k8s pods must be able to resolve it.** Kafka clients connect to the bootstrap address and then to whatever each broker *advertises*, so if pods can't resolve `broker-N.<domain>`, clients fail after the first connection. Before cutover, check from a pod: `nslookup broker-1.<domain>`. If that fails, either add the brokers to corporate DNS or CoreDNS, or set `external_host` to the broker IP in `inventory.conf`. Broker certs carry both FQDN and IP SANs, so either choice works without reissuing certs.
 
 `controller.quorum.voters=1@ctrl-1:9093,2@ctrl-2:9093,3@ctrl-3:9093,4@ctrl-4:9093,5@ctrl-5:9093` (static quorum; the voter set is fixed at format time).
 
@@ -65,6 +83,32 @@ Off-VM: **Kafbat UI** (Kubernetes), **Grafana** (existing), **MongoDB** (existin
 | Rack 2 **or** rack 3 lost | ✅ 3/5 | ✅ 2 replicas remain, writes continue |
 | Rack 2/3 lost **+** one more controller | ❌ 2/5, cluster stops accepting metadata changes | — |
 | 2 brokers in different racks | ✅ | ⚠️ partitions with replicas on both go below `min.insync.replicas`; `acks=all` writes fail for those |
+
+### 2.4 How VMs know whom to talk to
+
+**Yes, through configuration. Nothing is discovered automatically.** `inventory.conf` is the single source of truth, and every config is rendered from it:
+
+```text
+# name       ip          zone    rack   role        node_id  heap  external_host
+ctrl-1       10.0.1.11   rhel    rack1  controller  1        1g    -
+ctrl-2       10.0.2.11   ubuntu  rack2  controller  2        1g    -
+broker-1     10.0.1.21   rhel    rack1  broker      101      6g    broker-1.<domain>
+connect-2    10.0.2.31   ubuntu  rack2  connect     -        3g    -
+...
+```
+
+| Who | Needs to know | Rendered into |
+| :--- | :--- | :--- |
+| Controllers | all 5 controllers | `controller.quorum.voters` |
+| Brokers | all 5 controllers + its own name, rack, ID | `controller.quorum.bootstrap.servers` / voters, `node.id`, `broker.rack`, `advertised.listeners` |
+| Connect, REST, exporter, ops scripts | **a few** brokers (`bootstrap.servers`, one per rack). The client learns all other brokers from cluster metadata. | `bootstrap.servers=broker-1:9092,broker-4:9092,broker-7:9092` |
+| Connect workers ↔ each other | **nothing**. They find each other through Kafka (same `group.id` + internal topics). Each advertises its own REST address for request forwarding. | `group.id`, `rest.advertised.host.name` |
+| Prometheus | both exporters | `prometheus.yml` scrape targets |
+| Ops scripts | every host, zone and role | read the inventory directly (SSH for Ubuntu, agent for RHEL) |
+| `rhel-agent` | Rack 1 hosts and their services | copy of the inventory (Rack 1 rows only) |
+| Every VM | hostname → IP of all 17 VMs | DNS, or `/etc/hosts` generated from the inventory by `setup-node.sh` |
+
+**Changing the topology** (e.g. replacing a VM) means editing `inventory.conf`, re-rendering configs (`setup-node.sh --render-only`), and doing a rolling restart of the affected tiers.
 
 ---
 
@@ -112,34 +156,35 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
   # in connector JSON:
   "connection.uri": "${file:/etc/kafka/secrets/credentials.properties:mongo.uri}"
   ```
-* Connect REST API on **8083 over HTTPS** (cluster CA). Kafbat UI in k8s and the ops node call it.
+* Connects to brokers on `INTERNAL` **9092**.
+* Connect REST API on **8083 over HTTPS** (cluster CA). The ops node and Kafbat UI (from k8s) call it.
 
 ### 4.4 REST Proxy (2 instances)
-* Runs on `connect-2` and `connect-3`, port 8082. Its only consumer is the internal **log service in Kubernetes**, which calls `rest.kafka.<domain>:8082`.
+* Runs on `connect-2` and `connect-3`, port **8082**, and talks to brokers on 9092. Its only consumer is the internal **log service in Kubernetes**, which calls `rest.kafka.<domain>:8082`.
 * **Failover is manual:** the DNS name points at `connect-2`; if it fails, repoint it to `connect-3`. This is documented in §8.
 * The REST Proxy authenticates to brokers as its own principal (`User:kafka-rest`), so ACLs for everything the log service does are granted to that principal.
 * ⚠️ If the log service uses **v2 consumer instances**, those are stateful per proxy instance and are lost on failover. The service must recreate its consumer instance on errors. Producing (v2/v3) is stateless.
 
 ### 4.5 Monitoring
-* **kafka_exporter v1.9.0** on `connect-2` and `connect-3` (port 9308) exposes consumer lag, offsets, partition, ISR and broker counts. It connects with mTLS as `User:kafka-exporter` (Describe-only ACLs).
+* **kafka_exporter v1.9.0** on `connect-2` and `connect-3` (port **9308**) exposes consumer lag, offsets, partition, ISR and broker counts. It connects to brokers on 9092 with mTLS as `User:kafka-exporter` (Describe-only ACLs).
+* **Source:** the exporter image you already have on site. The image contains a single static binary, which `setup-node.sh` installs to `/opt/kafka-exporter/` and runs under systemd. The binary is extracted once with `docker create` + `docker cp <id>:/bin/kafka_exporter`. No container runtime is needed on the VMs.
+* The exporter is a Go program and can't read PKCS12 keystores, so it gets **PEM** files (`ca.pem`, `kafka-exporter.pem`, `kafka-exporter.key`) from `generate-certs.sh`.
 * **Prometheus** on `connect-2` and `connect-3` (port 9090). **Each Prometheus scrapes both exporters**, so either one alone has full data. Series carry an `instance` label. Grafana dashboards aggregate with `max by (topic, partition, consumergroup)` to avoid double-counting.
 * Prometheus TSDB in `/data/prometheus`, `--storage.tsdb.retention.time=15d --storage.tsdb.retention.size=15GB`.
 * The existing **Grafana** gets two datasources (`prometheus-r2`, `prometheus-r3`). Point dashboards at r2 and switch to r3 if r2 is down.
-* **Accepted gap:** no JMX or host metrics. Disk usage on the 100 GB `/data` disks is therefore **not** monitored by Prometheus, and `health-check.sh` reports it instead (see §10).
+* **Accepted gap:** no JMX or host metrics. Disk usage on the 100 GB `/data` disks is therefore **not** monitored by Prometheus, and `health-check.sh` reports it instead (§7).
 
-### 4.6 Kafbat UI (Kubernetes)
-* Image is pushed to the internal registry from the offline bundle (`offline-bundle/images/kafbat-ui.tar`).
-* `Deployment` with `replicas: 1`. Kubernetes restarts or reschedules it on pod or node failure, so no failover logic is needed.
-* Keystore/truststore live in a k8s `Secret`, and the principal is `User:kafbat-ui`. ACLs are read-only by default.
-* Needs network access from k8s to brokers `:9094` and Connect `:8083`.
-* Manifests live in `k8s/kafbat-ui/`.
+### 4.6 Kafbat UI (Kubernetes, yours)
+* You deploy and run it in k8s from the image already on site, so it's **not** in the bundle or this repo. Run it as a Deployment with `replicas: 1` so k8s reschedules it on failure.
+* What this repo provides: a client keystore/truststore (`CN=kafbat-ui`) for you to put in a k8s Secret, read-only ACLs for `User:kafbat-ui`, and firewall entries.
+* Points at brokers on **`EXTERNAL` 29092** and Connect on **8083**.
 
 ---
 
 ## 5. Security
 
 ### 5.1 TLS and principals
-* `certs/generate-certs.sh` creates a self-signed **cluster CA** and one **per-host keystore** (PKCS12) for every VM. SANs are hostname + FQDN + IP, and hostname verification is enabled.
+* `certs/generate-certs.sh` creates a self-signed **cluster CA** and one **per-host keystore** (PKCS12) for every VM. SANs are hostname + FQDN + IP (and `external_host` for brokers), and hostname verification is enabled. Client certs for Go tools (exporter) are also written as PEM.
 * The **CN identifies the role, not the host**, so every host of a role maps to one principal while each host still has its own key:
 
   | Cert | CN → principal | Used by |
@@ -158,16 +203,101 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 * `allow.everyone.if.no.acl.found=false`
 * Certificates have a fixed validity period; `rotate-certs.sh` re-issues them and does a rolling restart (see §7).
 
-### 5.2 Secrets on disk
-Docker secrets are replaced by root-provisioned files owned `kafka:kafka`, mode `600`:
-* `/etc/kafka/certs/` contains `keystore.p12` and `truststore.p12`
-* `/etc/kafka/secrets/credentials.properties` holds keystore passwords and `mongo.uri` (used via `FileConfigProvider`)
-* `/etc/kafka/secrets/service.env` holds env vars for REST, exporter, Prometheus and the agent (`AGENT_API_TOKEN`), loaded via systemd `EnvironmentFile=`
+### 5.2 Secrets: lifecycle
 
-Real secrets and generated certs are **never committed** (`.gitignore`).
+**1. Created on the main ops node (`ctrl-2`) only.**
+* `secrets/credentials.properties` and `secrets/service.env` are filled from the committed `.example` files.
+* `certs/output/` is produced by `generate-certs.sh`.
+* All of these are `.gitignore`d. **Real secrets never enter Git or the offline bundle.** They're synced to `ctrl-4` by `ops-sync.sh` and carried to `ctrl-1` for the RHEL zone over the same approved transfer path as the bundle.
+
+**2. Distributed, each host getting only what it needs.** `distribute-certs.sh` and `distribute-secrets.sh` copy over SSH (Ubuntu zone, from `ctrl-2`) or locally from `ctrl-1` (RHEL zone). Every file lands `root:kafka`, `0640`, in directories `0750`:
+
+| File | Content | Hosts |
+| :--- | :--- | :--- |
+| `/etc/kafka/certs/keystore.p12` | this host's key + cert | every VM |
+| `/etc/kafka/certs/truststore.p12` | cluster CA | every VM |
+| `/etc/kafka/certs/*.pem` | CA + exporter cert/key | `connect-2`, `connect-3` |
+| `/etc/kafka/secrets/credentials.properties` | keystore/key/truststore passwords; `mongo.uri` only on Connect VMs | every VM |
+| `/etc/kafka/secrets/service.env` | `AGENT_API_TOKEN` | `ctrl-1`, `ctrl-2`, `ctrl-4` |
+
+**3. Consumed without ever writing plaintext into configs.**
+
+| Service | How it reads secrets |
+| :--- | :--- |
+| Brokers, controllers, Connect workers | `FileConfigProvider`: `ssl.keystore.password=${file:/etc/kafka/secrets/credentials.properties:ssl.keystore.password}` |
+| MongoDB connectors | `FileConfigProvider` in the connector JSON (`${file:...:mongo.uri}`). The URI never lands in the `connect-configs` topic, because only the placeholder is stored there. |
+| REST Proxy | Its properties are rendered with passwords at install time into `/etc/kafka/kafka-rest.properties` (`root:kafka 0640`). Whether CP REST Proxy resolves config providers still needs to be **verified on the CP version**. If it does, we switch to placeholders. |
+| kafka_exporter | PEM key file path in its flags. No password, since the key is unencrypted and protected by file permissions. |
+| `rhel-agent` and ops scripts | `AGENT_API_TOKEN` from `service.env` (systemd `EnvironmentFile=` for the agent; sourced by scripts) |
+
+**4. Rotated** by editing the source file on `ctrl-2`, then `ops-sync.sh` → `distribute-secrets.sh` → rolling restart of the affected tier. Certs are rotated with `rotate-certs.sh`.
 
 ### 5.3 SELinux (RHEL rack)
 SELinux stays **enforcing**. Since `/data` and `/opt/*` are non-default paths, `setup-node.sh` applies file contexts (`semanage fcontext` + `restorecon`) and opens ports with `semanage port` where needed. It must never call `setenforce 0`.
+
+### 5.4 Service users and systemd units
+
+**Users**, created by `setup-node.sh` with the **same UID/GID on every VM** (set in `inventory.conf`, default `1500`) so file ownership stays consistent across hosts and archives:
+
+| User | Where | Purpose |
+| :--- | :--- | :--- |
+| `kafka` (system user, `nologin`, home `/opt/kafka-home`) | every VM | runs every Kafka/ecosystem unit; owns `/data/kafka`, `/data/log/kafka`, `/data/prometheus` |
+| `kafka-agent` (system user, `nologin`) | `ctrl-1` | runs `rhel-agent`; sudo limited to `systemctl start/stop/restart/is-active kafka-* ` plus SSH to Rack 1 hosts |
+| `kafka-ops` (login user, SSH key) | `ctrl-2`, `ctrl-4` (+ authorized on Ubuntu VMs) | the account operators use to run the ops scripts; sudo limited to `systemctl … kafka-*`, `prometheus`, and the file distribution paths |
+
+```bash
+groupadd --system --gid 1500 kafka
+useradd  --system --uid 1500 --gid kafka --home-dir /opt/kafka-home \
+         --shell /sbin/nologin kafka
+```
+
+**Units** (`systemd/*.service`, installed to `/etc/systemd/system/`):
+
+| Unit | VMs | `ExecStart` |
+| :--- | :--- | :--- |
+| `kafka-controller` | `ctrl-*` | `kafka-server-start /etc/kafka/controller.properties` |
+| `kafka-broker` | `broker-*` | `kafka-server-start /etc/kafka/broker.properties` |
+| `kafka-connect` | `connect-*` | `connect-distributed /etc/kafka/connect-distributed.properties` |
+| `kafka-rest` | `connect-2/3` | `kafka-rest-start /etc/kafka/kafka-rest.properties` |
+| `kafka-exporter` | `connect-2/3` | `/opt/kafka-exporter/kafka_exporter --kafka.server=… --tls.* …` |
+| `prometheus` | `connect-2/3` | `/opt/prometheus/prometheus --config.file=… --storage.tsdb.*` |
+| `rhel-agent` | `ctrl-1` | `/usr/bin/python3 /opt/kafka-ops/scripts/rhel-agent.py` |
+
+Example, `kafka-broker.service`. The other Kafka units have the same shape:
+
+```ini
+[Unit]
+Description=Apache Kafka broker
+After=network-online.target
+Wants=network-online.target
+# give up after 3 failed starts in 10 min → a human investigates
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+Environment=JAVA_HOME=/opt/java
+Environment=LOG_DIR=/data/log/kafka
+Environment=KAFKA_LOG4J_OPTS=-Dlog4j2.configurationFile=/etc/kafka/log4j2.yaml
+# per-host values rendered from inventory: KAFKA_HEAP_OPTS="-Xms6g -Xmx6g", KAFKA_JVM_PERFORMANCE_OPTS
+EnvironmentFile=/etc/kafka/broker.env
+ExecStart=/opt/confluent/bin/kafka-server-start /etc/kafka/broker.properties
+Restart=on-failure
+RestartSec=30
+# controlled shutdown moves leadership away; give it time instead of SIGKILL
+TimeoutStopSec=300
+SuccessExitStatus=143
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
+```
+
+* Units are **enabled**, so a rebooted VM rejoins on its own. Brokers keep retrying until the controllers are reachable, so boot order across VMs doesn't matter. `cluster-start.sh` still enforces the order for planned starts.
+* Services run in the **foreground** (no `-daemon`), so systemd tracks the real PID and nothing writes `*.out` files.
+* On RHEL, the units and paths get SELinux contexts (§5.3).
 
 ---
 
@@ -235,10 +365,10 @@ Bootstrap-only: `build-offline-bundle.sh`, `generate-certs.sh`, `distribute-cert
 6. **Ubuntu zone** (on `ctrl-2`): the same three scripts with `--zone ubuntu`, then `ops-sync.sh`.
 7. **Start:** `cluster-start.sh` (Connect waits) → `create-topics.sh` → `create-acls.sh` → start Connect → `health-check.sh`.
 8. **Connectors:** `connectors/create-all.sh`.
-9. **k8s:** load the Kafbat image into the registry, create the Secret, apply `k8s/kafbat-ui/`, and add both Prometheus datasources to Grafana.
+9. **k8s and Grafana:** hand the `kafbat-ui` keystore/truststore to whoever runs Kafbat in k8s, check from a pod that broker names resolve and `:29092` is reachable (§2.2), and add both Prometheus datasources to Grafana.
 10. **Cutover:** repoint clients and the log service to the new cluster, then decommission Swarm.
 
-`setup-node.sh` unpacks the binaries, creates the `kafka` user, renders configs from templates, installs units, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
+`setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, generates `/etc/hosts` if DNS isn't used, installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
 
 ### 8.2 REST Proxy failover
 1. Confirm `connect-2`'s REST Proxy is down: `health-check.sh`.
@@ -252,7 +382,7 @@ SSH into `ctrl-4` and work from `/opt/kafka-ops`. When `ctrl-2` returns, run `op
 ### 8.4 Disk pressure on `/data`
 1. `health-check.sh` shows which VM and directory is affected (`/data/kafka` vs `/data/log/kafka`).
 2. Lower `retention.bytes` / `retention.ms` on the biggest topics (`kafka-configs --alter`) and update `topics.conf` to match.
-3. If it's logs, check the Log4j2 caps (§10).
+3. If it's logs, check the Log4j2 caps (§10.1).
 
 ---
 
@@ -268,17 +398,16 @@ SSH into `ctrl-4` and work from `/opt/kafka-ops`. When `ctrl-2` returns, run `op
 | :--- | :--- | :--- |
 | `binaries/confluent-8.x.y.tar.gz` | Confluent Platform (Kafka, Connect, REST Proxy, CLI tools) | all VMs (brokers/controllers use only the Kafka parts) |
 | `binaries/OpenJDK21U-jdk_x64_linux_*.tar.gz` | JDK 21 (Temurin) | all VMs |
-| `binaries/kafka_exporter-1.9.0.linux-amd64.tar.gz` | danielqsj/kafka_exporter | `connect-2`, `connect-3` |
 | `binaries/prometheus-<ver>.linux-amd64.tar.gz` | Prometheus | `connect-2`, `connect-3` |
 | `connect-plugins/mongodb-kafka-connect-mongodb-<ver>.zip` | Official MongoDB connector (with all dependency jars) | `connect-*` |
-| `images/kafbat-ui-<ver>.tar` | `docker save` of the Kafbat UI image | loaded into the internal k8s registry |
 | `os-packages/rhel9/*.rpm` | OS tools + all their dependencies (see 9.2) | RHEL VMs |
 | `os-packages/ubuntu2204/*.deb` | OS tools + all their dependencies (see 9.2) | Ubuntu VMs |
 | `repo/kafka-ops.tar.gz` | This Git repo (`git archive`) + a `git bundle` for the full history | `ctrl-1`, `ctrl-2`, `ctrl-4` |
 | `grafana/dashboards/*.json` | Kafka exporter / lag dashboards, pre-downloaded | imported into the existing Grafana |
-| `k8s/` | Kafbat manifests (image path rewritten to the internal registry) | k8s |
 | `docs/` | Offline copies of the relevant docs (Kafka ops, Connect REST API, MongoDB connector config reference) | ops nodes |
 | `SHA256SUMS`, `versions.env` | Integrity + exact versions | all |
+
+**Not in the bundle, because they already exist on the air-gapped side:** the kafka_exporter v1.9.0 image (we extract the binary from it, §4.5), the Kafbat UI image, and anything k8s-side. `setup-node.sh` takes the exporter binary path as a parameter (`--exporter-bin`).
 
 ### 9.2 OS packages (downloaded with all dependencies)
 
@@ -300,7 +429,7 @@ The full list is in `offline-bundle/packages-rhel9.txt` and `packages-ubuntu2204
 
 ### 9.3 Air-gap rules for the code
 * Scripts never call public URLs. All endpoints come from `inventory.conf`.
-* Kafbat UI, Prometheus and Connect are configured with no update checks, telemetry or remote plugin loading. Confluent telemetry/metrics reporters are disabled (`confluent.telemetry.enabled=false`).
+* Prometheus and Connect are configured with no update checks, telemetry or remote plugin loading. Confluent telemetry/metrics reporters are disabled (`confluent.telemetry.enabled=false`).
 * Connector plugins are loaded only from `/opt/connect-plugins`, with no Confluent Hub installs.
 * The bundle includes the repo, so a VM can be fully rebuilt using only the bundle.
 
@@ -322,12 +451,27 @@ The full list is in `offline-bundle/packages-rhel9.txt` and `packages-ubuntu2204
 | `/opt/kafka-exporter`, `/opt/prometheus` | `connect-2`, `connect-3` |
 | `/opt/kafka-ops` | Ops repo checkout (`ctrl-2`, `ctrl-4`); agent (`ctrl-1`) |
 | `/etc/kafka/` | Rendered `.properties`, `log4j2.yaml` |
-| `/etc/kafka/certs/`, `/etc/kafka/secrets/` | `600`, `kafka:kafka` |
+| `/etc/kafka/certs/`, `/etc/kafka/secrets/` | dirs `0750`, files `0640`, `root:kafka` (the service can read but not modify) |
 | `/data/kafka` | Broker logs / controller metadata |
 | `/data/prometheus` | Prometheus TSDB |
-| `/data/log/kafka` | Service logs. Log4j2 `RollingFile`, **100 MB × 10 files per service**, plus GC logs capped the same way. |
+| `/data/log/kafka` | Service logs (see 10.1) |
+| `/opt/kafka-home` | `kafka` user home (empty) |
 
-Logging uses Log4j2 (`log4j2.yaml`), because Kafka 4.x does not read Log4j 1.x configs.
+### 10.1 Log rotation (no `logrotate` needed)
+
+Kafka has two kinds of "logs", and each one handles its own cleanup:
+
+| What | Where | Who cleans it |
+| :--- | :--- | :--- |
+| **Topic data** (Kafka "log segments") | `/data/kafka` | **Kafka itself**: `log.retention.hours` / `retention.bytes` delete old segments. This is retention, not rotation, and must **never** be touched with `logrotate` or `rm`. |
+| **Application logs** (`server.log`, `controller.log`, `connect.log`, `kafka-rest.log`, `state-change.log`, …) | `/data/log/kafka` | **Log4j2**: our `log4j2.yaml` uses `RollingFile` with a size trigger (100 MB) and `DefaultRolloverStrategy max=10` + a `Delete` action, so each file is capped at about 1 GB. |
+| **GC logs** | `/data/log/kafka/*-gc.log*` | **The JVM**: Kafka's start scripts already pass `-Xlog:gc*:file=…:filecount=10,filesize=100M`. |
+| **stdout/stderr** of every unit (exporter, Prometheus, startup errors) | journald | **journald**: drop-in `/etc/systemd/journald.conf.d/kafka.conf` with `SystemMaxUse=1G`. |
+| `rhel-agent` audit log | `/data/log/kafka/rhel-agent.log` | Python `RotatingFileHandler` (10 MB × 5). |
+
+⚠️ The **stock** `log4j2.yaml` shipped with Kafka rolls files by **time and never deletes them**, which on a 100 GB disk eventually fills `/data`. That's why we ship our own. Worst case for logs is about 8–10 GB per VM.
+
+Kafka 4.x reads only Log4j2 (`log4j2.yaml`); Log4j 1.x configs from 3.9 don't work.
 
 ---
 
@@ -336,8 +480,8 @@ Logging uses Log4j2 (`log4j2.yaml`), because Kafka 4.x does not read Log4j 1.x c
 | Port | From → To | Purpose |
 | :--- | :--- | :--- |
 | 9093 | controllers ↔ controllers, brokers → controllers | KRaft (mTLS) |
-| 9092 | brokers ↔ brokers | Inter-broker (mTLS) |
-| 9094 | Connect, REST, exporters, ops nodes, **k8s** → brokers | Clients (mTLS) |
+| 9092 | brokers ↔ brokers; Connect VMs, `ctrl-2`, `ctrl-4` → brokers | `INTERNAL`: inter-broker + VM-side clients (mTLS) |
+| 29092 | **k8s** (apps, Kafbat UI) → brokers | `EXTERNAL`: k8s clients (mTLS) |
 | 8083 | ops nodes, connect ↔ connect, **k8s (Kafbat)** → Connect VMs | Connect REST (HTTPS) |
 | 8082 | **k8s (log service)** → `connect-2`, `connect-3` | REST Proxy |
 | 9308 | Prometheus → exporters (`connect-2`, `connect-3`) | Exporter metrics |
@@ -346,7 +490,7 @@ Logging uses Log4j2 (`log4j2.yaml`), because Kafka 4.x does not read Log4j 1.x c
 | 22 | within the Ubuntu zone (ops nodes → all Ubuntu VMs, `ctrl-2` ↔ `ctrl-4`); within the RHEL zone (`ctrl-1` → RHEL VMs) | SSH |
 | 27017 | Connect VMs → MongoDB | Connector traffic |
 
-All 17 VMs must resolve each other by hostname (DNS or managed `/etc/hosts`), and the names must match the cert SANs.
+All 17 VMs must resolve each other by hostname (DNS or `/etc/hosts` generated from the inventory), and the names must match the cert SANs. k8s pods must resolve the brokers' `external_host` names (§2.2).
 
 ---
 
@@ -368,16 +512,17 @@ All 17 VMs must resolve each other by hostname (DNS or managed `/etc/hosts`), an
 │   ├── connect-distributed.properties.tmpl
 │   ├── kafka-rest.properties.tmpl
 │   ├── prometheus.yml.tmpl
-│   ├── log4j2.yaml
+│   ├── log4j2.yaml                # size-capped RollingFile + Delete
+│   ├── journald-kafka.conf
 │   ├── topics.conf
 │   └── acls.conf
 ├── connectors/*.json
 ├── systemd/
 │   ├── kafka-controller.service   kafka-broker.service   kafka-connect.service
 │   ├── kafka-rest.service         kafka-exporter.service prometheus.service
-│   └── rhel-agent.service
+│   ├── rhel-agent.service
+│   └── *.env.tmpl                 # per-host heap/JVM opts
 ├── grafana/dashboards/            # dashboards shipped in the bundle
-├── k8s/kafbat-ui/                 # Deployment, Service/Ingress, Secret template, config
 └── scripts/
     ├── lib/                       # common.sh (inventory parsing, ssh/agent dispatch, locking)
     ├── rhel-agent.py
@@ -392,7 +537,7 @@ All 17 VMs must resolve each other by hostname (DNS or managed `/etc/hosts`), an
 
 ## 13. Open Items & Risks
 
-1. **Staging host:** needs internet, Docker/Podman (for the RHEL 9 / Ubuntu 22.04 package containers and `docker save`), and a RHEL subscription or UBI repos for the RPM downloads.
+1. **Staging host:** needs internet, Docker/Podman (for the RHEL 9 / Ubuntu 22.04 package containers), and a RHEL subscription or UBI repos for the RPM downloads.
 2. **Version check:** confirm the exact CP 8.x / Kafka 4.x release and the MongoDB connector version available for the bundle, and that they're compatible with JDK 21.
 3. **No host or JMX metrics:** disk-full on the 100 GB disks is the most likely outage, and only `health-check.sh` catches it. Consider adding `node_exporter` later.
 4. **100 GB per broker** is small. Every new topic needs a capacity check against §4.1.
@@ -400,3 +545,5 @@ All 17 VMs must resolve each other by hostname (DNS or managed `/etc/hosts`), an
 6. **`rhel-agent`** is custom code with control over Rack 1. It needs code review and a security sign-off.
 7. **Static quorum:** changing the controller set later needs a planned migration to a dynamic quorum (KIP-853).
 8. **CA key custody:** decide where the offline CA key lives and who can issue certs.
+9. **k8s → broker DNS:** unknown whether pods resolve `broker-N.<domain>`. Must be checked before cutover, with IPs as the fallback (§2.2).
+10. **REST Proxy config providers:** verify on the chosen CP version; until then its properties file holds the passwords (`0640`).

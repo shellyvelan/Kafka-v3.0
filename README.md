@@ -180,7 +180,7 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 
 ### 4.6 Kafbat UI (Kubernetes, yours)
 * You deploy and run it in k8s from the image already on site, so it's **not** in the bundle or this repo. Run it as a Deployment with `replicas: 1` so k8s reschedules it on failure.
-* What this repo provides: the **shared k8s client cert** (`CN=k8s-clients`, §5.1), its ACLs, and firewall entries. You put the keystore/truststore in a k8s Secret.
+* What this repo provides: the **shared k8s client cert** (`CN=kafka-hichat-client`, §5.1), its ACLs, and firewall entries. You put the keystore/truststore in a k8s Secret.
 * Points at brokers on **`EXTERNAL` 29092** and Connect on **8083**.
 
 ---
@@ -200,12 +200,15 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
   | rest | `kafka-rest` | REST Proxy |
   | exporter | `kafka-exporter` | kafka_exporter |
   | admin | `kafka-admin` | ops scripts on `ctrl-2`/`ctrl-4` |
-  | k8s clients (**one shared cert**) | `k8s-clients` | every k8s client: apps, Kafbat UI. No SANs. |
+  | k8s clients (**one shared cert**) | `kafka-hichat-client` | every k8s client: apps, Kafbat UI. No SANs. |
 
 * `ssl.principal.mapping.rules=RULE:^CN=([^,]+).*$/$1/,DEFAULT`
 * `super.users=User:kafka-broker;User:kafka-controller;User:kafka-admin`
 * `allow.everyone.if.no.acl.found=false`
-* **Shared k8s cert, kept as today:** all k8s clients present the same cert, so to Kafka they are **one principal** (`User:k8s-clients`). Its ACLs are the union of what every k8s app needs. You can't restrict one app without restricting all of them, and audit logs can't tell apps apart. Splitting into per-app certs later only means issuing new certs and adding ACLs, with no broker changes.
+* **Shared k8s cert, kept as today:** all k8s clients present the same cert, so to Kafka they are **one principal** (`User:kafka-hichat-client`). Its ACLs are the union of what every k8s app needs. You can't restrict one app without restricting all of them, and audit logs can't tell apps apart. Splitting into per-app certs later only means issuing new certs and adding ACLs, with no broker changes.
+* **Reissued from the new CA at cutover.** The current shared cert (`C=US,ST=CA,L=MountainView,O=TestOrg,OU=Confluent,CN=kafka-hichat-client`) is signed by the old cluster's CA, which the new brokers don't trust. `generate-certs.sh` issues a replacement with the **same CN**, and it goes into the k8s Secret when apps are switched to the new cluster.
+* **Principal names change format.** The old cluster used the full DN as the principal (`User:C=US,…,CN=kafka-hichat-client`). With the mapping rule above, the new cluster uses just the CN (`User:kafka-hichat-client`). ACLs in `acls.conf` are written in the short form, so old ACL definitions can't be copied over unchanged.
+* The other DN fields (`O=TestOrg`, `OU=Confluent`, `L=MountainView`) are sample defaults. New certs use the subject fields set in `certs/cert.conf`. They don't affect the principal, because only the CN is used.
 * **Validity:** CA **10 years**, host and client certs **5 years**. `health-check.sh` warns 90 days before any cert expires, and `rotate-certs.sh` re-issues certs and does a rolling restart (§7).
 * **CA private key (`ca.key`):** anyone who has it can create a cert for any name, including `kafka-admin` (super user), so it is the most sensitive file in the setup.
   * Stored on **`ctrl-2`** in `certs/ca/`, **encrypted with a passphrase** (AES-256). It is never stored unencrypted on disk, and the passphrase is never written to a file. Operators type it only when `generate-certs.sh` / `rotate-certs.sh` issue certs.
@@ -374,7 +377,7 @@ Bootstrap-only: `build-offline-bundle.sh`, `generate-certs.sh`, `distribute-cert
 6. **Ubuntu zone** (on `ctrl-2`): the same three scripts with `--zone ubuntu`, then `ops-sync.sh`.
 7. **Start:** `cluster-start.sh` (Connect waits) → `create-topics.sh` → `create-acls.sh` → start Connect → `health-check.sh`.
 8. **Connectors:** `connectors/create-all.sh`.
-9. **k8s and Grafana:** put the shared `k8s-clients` keystore/truststore into the k8s Secret(s) used by the apps and Kafbat, check from a pod that `:29092` is reachable on every broker (DNS is confirmed), and add both Prometheus datasources to Grafana.
+9. **k8s and Grafana:** put the **reissued** shared `kafka-hichat-client` keystore/truststore into the k8s Secret(s) used by the apps and Kafbat, check from a pod that `:29092` is reachable on every broker (DNS is confirmed), and add both Prometheus datasources to Grafana.
 10. **Cutover:** repoint clients and the log service to the new cluster, then decommission Swarm.
 
 `setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, checks that every inventory host resolves in DNS (and stops if one doesn't), installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
@@ -513,7 +516,9 @@ All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the na
 │   ├── versions.env               # pinned versions + checksums
 │   ├── packages-rhel9.txt         # OS packages to fetch (with deps)
 │   └── packages-ubuntu2204.txt
-├── certs/generate-certs.sh
+├── certs/
+│   ├── generate-certs.sh
+│   └── cert.conf                  # subject fields (C, O, OU …), validity, client cert CNs
 ├── secrets/*.example
 ├── configs/
 │   ├── controller.properties.tmpl

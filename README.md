@@ -24,8 +24,8 @@ A greenfield, 3-rack KRaft Kafka cluster running as `systemd` services on 17 VMs
 | Cross-zone ops | RHEL ↔ Ubuntu SSH is blocked; a hardened **`rhel-agent`** (fixed actions only) on `ctrl-1` executes Rack 1 operations. |
 | Ops node | **`ctrl-2`** (main) and **`ctrl-4`** (secondary), kept in sync with `ops-sync.sh`. |
 | Config generation | `inventory.conf` + `envsubst` templates (pure bash, no Ansible). The inventory is the single source of truth for who talks to whom (§2.4). |
-| Service accounts | System user `kafka` runs every Kafka/ecosystem unit; `kafka-agent` runs the agent (§5.4). |
-| systemd | One unit per service, `enabled` at boot, `Restart=on-failure` with a limit of 3 tries per 10 min (§5.4). |
+| Service accounts | System user `kafka` runs every Kafka/ecosystem unit; `kafka-agent` runs the agent (§5.5). |
+| systemd | One unit per service, `enabled` at boot, `Restart=on-failure` with a limit of 3 tries per 10 min (§5.5). |
 | Storage | Every VM has a single 100 GB `/data` disk: Kafka data in `/data/kafka`, logs in `/data/log/kafka`. |
 | Retention | Default **72 h** plus a per-topic `retention.bytes` cap. |
 
@@ -244,10 +244,41 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 
 **4. Rotated** by editing the source file on `ctrl-2`, then `ops-sync.sh` → `distribute-secrets.sh` → rolling restart of the affected tier. Certs are rotated with `rotate-certs.sh`.
 
-### 5.3 SELinux (RHEL rack)
+### 5.3 ACLs (`configs/acls.conf`)
+
+Applied idempotently by `create-acls.sh`. Super users (`kafka-broker`, `kafka-controller`, `kafka-admin`) need no ACLs. Everything not listed is denied.
+
+| Principal | Resource | Operations | Notes |
+| :--- | :--- | :--- | :--- |
+| `User:kafka-hichat-client` (all k8s clients) | topic `*` | Read, Write, Describe | Same as the old cluster, minus Create |
+| | group `*` | Read, Describe | |
+| | cluster | Describe | **ClusterAction dropped**: broker-only permission, not used by clients |
+| `User:kafka-connect` | topic `*` | Read, Write, Describe | Source and sink connectors + internal topics |
+| | group `connect-*` (prefixed) | Read, Describe | Worker group `connect-cluster` + sink groups `connect-<name>` |
+| | cluster | Describe | |
+| `User:kafka-rest` | topic `*` | Read, Write, Describe | Whatever the log service produces/consumes through the proxy |
+| | group `*` | Read, Describe | v2 consumer instances |
+| | cluster | Describe | |
+| `User:kafka-exporter` | topic `*`, group `*`, cluster | Describe | Read-only metrics |
+
+**Deliberate decisions:**
+* **No client can create topics.** `topic Create` was removed from `kafka-hichat-client`, and no other client principal has it. Every topic goes through `create-topics.sh`, which enforces `retention.bytes` to protect the 100 GB disks. An app that tries to create a topic gets `TOPIC_AUTHORIZATION_FAILED` and the topic must be added to `topics.conf`. MongoDB source connectors therefore need their target topics pre-created, with no `topic.creation.*`.
+* **`kafka-hichat-client` keeps `topic *` as-is**, which **includes the Connect internal topics** (`connect-configs`, `connect-offsets`, `connect-status`). Accepted risk: any k8s app can read connector configs (no secrets, thanks to `FileConfigProvider`) and could overwrite connector configs or source offsets. Mitigation if needed later: one `DENY` ACL on the `connect-` prefix. In Kafka, DENY overrides ALLOW.
+* **Troubleshooting denials:** brokers log every denied request in `/data/log/kafka/kafka-authorizer.log` (Log4j2 logger `kafka.authorizer.logger` at `INFO`), so missing ACLs show up there instead of having to be guessed.
+
+`acls.conf` format, one rule per line:
+```text
+# principal               resource-type  pattern  name          operations
+kafka-hichat-client       topic          literal  *             Read,Write,Describe
+kafka-hichat-client       group          literal  *             Read,Describe
+kafka-hichat-client       cluster        literal  kafka-cluster Describe
+kafka-connect             group          prefixed connect-      Read,Describe
+```
+
+### 5.4 SELinux (RHEL rack)
 SELinux stays **enforcing**. Since `/data` and `/opt/*` are non-default paths, `setup-node.sh` applies file contexts (`semanage fcontext` + `restorecon`) and opens ports with `semanage port` where needed. It must never call `setenforce 0`.
 
-### 5.4 Service users and systemd units
+### 5.5 Service users and systemd units
 
 **Users**, created by `setup-node.sh` with the **same UID/GID on every VM** (`kafka` = **1500**, confirmed free; set in `inventory.conf`) so file ownership stays consistent across hosts and archives. `setup-node.sh` stops if UID/GID 1500 already belongs to a different user or group, rather than silently picking another number:
 
@@ -309,7 +340,7 @@ WantedBy=multi-user.target
 
 * Units are **enabled**, so a rebooted VM rejoins on its own. Brokers keep retrying until the controllers are reachable, so boot order across VMs doesn't matter. `cluster-start.sh` still enforces the order for planned starts.
 * Services run in the **foreground** (no `-daemon`), so systemd tracks the real PID and nothing writes `*.out` files.
-* On RHEL, the units and paths get SELinux contexts (§5.3).
+* On RHEL, the units and paths get SELinux contexts (§5.4).
 
 ---
 
@@ -380,7 +411,7 @@ Bootstrap-only: `build-offline-bundle.sh`, `generate-certs.sh`, `distribute-cert
 9. **k8s and Grafana:** put the **reissued** shared `kafka-hichat-client` keystore/truststore into the k8s Secret(s) used by the apps and Kafbat, check from a pod that `:29092` is reachable on every broker (DNS is confirmed), and add both Prometheus datasources to Grafana.
 10. **Cutover:** repoint clients and the log service to the new cluster, then decommission Swarm.
 
-`setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, checks that every inventory host resolves in DNS (and stops if one doesn't), installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
+`setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.5), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, checks that every inventory host resolves in DNS (and stops if one doesn't), installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
 
 ### 8.2 REST Proxy failover
 1. Confirm `connect-2`'s REST Proxy is down: `health-check.sh`.
@@ -560,3 +591,5 @@ All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the na
 7. **Static quorum:** changing the controller set later needs a planned migration to a dynamic quorum (KIP-853).
 8. **CA passphrase holders:** name the operators who know the CA passphrase (the key itself lives encrypted on `ctrl-2`/`ctrl-4`, §5.1).
 9. **Shared k8s client cert:** one principal for all k8s apps (§5.1). Accepted for now; revisit if per-app ACLs or auditing are needed.
+10. **k8s access to Connect internal topics:** `topic *` includes `connect-*` (§5.3). Accepted; a single DENY ACL closes it if needed.
+11. **No topic auto-creation by apps:** check before cutover that no k8s app relies on creating its own topics, and add any it does to `topics.conf`.

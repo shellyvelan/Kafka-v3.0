@@ -162,7 +162,7 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 ### 4.4 REST Proxy (2 instances)
 * Runs on `connect-2` and `connect-3`, port **8082**, and talks to brokers on 9092. Its only consumer is the internal **log service in Kubernetes**, which calls `https://rest.kafka.<domain>:8082`.
 * **Two TLS sides, as in the current Swarm setup:**
-  * **Server side** (`ssl.keystore.*`): REST Proxy's own HTTPS listener that the log service connects to. Cert SANs include `rest.kafka.<domain>` **and** both VM names, so the DNS failover in §8.2 doesn't break TLS.
+  * **Server side** (`ssl.keystore.*`): REST Proxy's own HTTPS listener that the log service connects to. Cert SANs include `rest.kafka.<domain>` **and** both VM names, so the DNS failover in §8.2 doesn't break TLS. **No client cert is required** (`ssl.client.auth=false`, same as Swarm): the log service only needs the cluster CA to trust the server.
   * **Client side** (`client.ssl.keystore.*` / `client.ssl.truststore.*`): REST Proxy's mTLS identity towards the brokers (`CN=kafka-rest`).
   * Both use the same per-host keystore (one cert with the role CN plus the extra SANs), so the paths match the Swarm env vars `KAFKA_REST_SSL_KEYSTORE_LOCATION`, `KAFKA_REST_CLIENT_SSL_KEYSTORE_LOCATION` and `KAFKA_REST_CLIENT_SSL_TRUSTSTORE_LOCATION`. The log service needs the **cluster CA** in its truststore.
 * **Failover is manual:** the DNS name points at `connect-2`; if it fails, repoint it to `connect-3`. This is documented in §8.
@@ -180,7 +180,7 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 
 ### 4.6 Kafbat UI (Kubernetes, yours)
 * You deploy and run it in k8s from the image already on site, so it's **not** in the bundle or this repo. Run it as a Deployment with `replicas: 1` so k8s reschedules it on failure.
-* What this repo provides: a client keystore/truststore (`CN=kafbat-ui`) for you to put in a k8s Secret, read-only ACLs for `User:kafbat-ui`, and firewall entries.
+* What this repo provides: the **shared k8s client cert** (`CN=k8s-clients`, §5.1), its ACLs, and firewall entries. You put the keystore/truststore in a k8s Secret.
 * Points at brokers on **`EXTERNAL` 29092** and Connect on **8083**.
 
 ---
@@ -188,7 +188,8 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 ## 5. Security
 
 ### 5.1 TLS and principals
-* `certs/generate-certs.sh` creates a self-signed **cluster CA** and one **per-host keystore** (PKCS12) for every VM. SANs are hostname + FQDN + IP (and `external_host` for brokers), and hostname verification is enabled. Client certs for Go tools (exporter) are also written as PEM.
+* `certs/generate-certs.sh` creates a self-signed **cluster CA** and one **per-host keystore** (PKCS12) for every VM. SANs are hostname + FQDN + IP (and `external_host` for brokers). Client certs for Go tools (exporter) are also written as PEM.
+* **Hostname checks happen in one direction only.** A *client* checks that the *broker's* cert matches the broker hostname it dialed (`ssl.endpoint.identification.algorithm=https`). That's why broker, controller, Connect and REST *server* certs carry SANs. A *broker* never checks a client's hostname. It only checks that the client cert is **signed by a trusted CA** and maps the CN to a principal. **Client certs therefore have no hostname or SAN requirement** and can be used from anywhere, including any k8s pod on any node.
 * The **CN identifies the role, not the host**, so every host of a role maps to one principal while each host still has its own key:
 
   | Cert | CN → principal | Used by |
@@ -199,12 +200,12 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
   | rest | `kafka-rest` | REST Proxy |
   | exporter | `kafka-exporter` | kafka_exporter |
   | admin | `kafka-admin` | ops scripts on `ctrl-2`/`ctrl-4` |
-  | kafbat | `kafbat-ui` | Kafbat UI (k8s) |
-  | apps | `<app-name>` | k8s apps connecting natively |
+  | k8s clients (**one shared cert**) | `k8s-clients` | every k8s client: apps, Kafbat UI. No SANs. |
 
 * `ssl.principal.mapping.rules=RULE:^CN=([^,]+).*$/$1/,DEFAULT`
 * `super.users=User:kafka-broker;User:kafka-controller;User:kafka-admin`
 * `allow.everyone.if.no.acl.found=false`
+* **Shared k8s cert, kept as today:** all k8s clients present the same cert, so to Kafka they are **one principal** (`User:k8s-clients`). Its ACLs are the union of what every k8s app needs. You can't restrict one app without restricting all of them, and audit logs can't tell apps apart. Splitting into per-app certs later only means issuing new certs and adding ACLs, with no broker changes.
 * **Validity:** CA **10 years**, host and client certs **5 years**. `health-check.sh` warns 90 days before any cert expires, and `rotate-certs.sh` re-issues certs and does a rolling restart (§7).
 * **CA private key (`ca.key`):** anyone who has it can create a cert for any name, including `kafka-admin` (super user), so it is the most sensitive file in the setup.
   * Stored on **`ctrl-2`** in `certs/ca/`, **encrypted with a passphrase** (AES-256). It is never stored unencrypted on disk, and the passphrase is never written to a file. Operators type it only when `generate-certs.sh` / `rotate-certs.sh` issue certs.
@@ -234,7 +235,7 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 | :--- | :--- |
 | Brokers, controllers, Connect workers | `FileConfigProvider`: `ssl.keystore.password=${file:/etc/kafka/secrets/credentials.properties:ssl.keystore.password}` |
 | MongoDB connectors | `FileConfigProvider` in the connector JSON (`${file:...:mongo.uri}`). The URI never lands in the `connect-configs` topic, because only the placeholder is stored there. |
-| REST Proxy | In Swarm, the Confluent image built the properties file from `KAFKA_REST_*` env vars. On VMs, `setup-node.sh` renders `/etc/kafka/kafka-rest.properties` directly: keystore/truststore **locations** as paths, and the **passwords** for both the server and client keystores. Whether REST Proxy resolves `${file:…}` placeholders still needs to be **tested on the CP version**. If it does, the passwords become placeholders. If not, they stay inline in this file, which is `root:kafka 0640`. |
+| REST Proxy | Same pattern as Swarm (`KAFKA_REST_CLIENT_SSL_KEYSTORE_PASSWORD=$$(cat /run/secrets/…)`): passwords are injected **at start time** and never written into `/etc`. `/etc/kafka/kafka-rest.properties.tmpl` holds placeholders. `ExecStartPre=/opt/kafka-ops/scripts/render-runtime-config.sh kafka-rest` fills them from `credentials.properties` into `/run/kafka-rest/kafka-rest.properties`. That's a tmpfs (`RuntimeDirectory=kafka-rest`, `0700`, `kafka` only), so it's wiped when the service stops or the VM reboots. `ExecStart` points at that runtime file. This works regardless of whether REST Proxy supports `${file:}`. |
 | kafka_exporter | PEM key file path in its flags. No password, since the key is unencrypted and protected by file permissions. |
 | `rhel-agent` and ops scripts | `AGENT_API_TOKEN` from `service.env` (systemd `EnvironmentFile=` for the agent; sourced by scripts) |
 
@@ -266,7 +267,7 @@ useradd  --system --uid 1500 --gid kafka --home-dir /opt/kafka-home \
 | `kafka-controller` | `ctrl-*` | `kafka-server-start /etc/kafka/controller.properties` |
 | `kafka-broker` | `broker-*` | `kafka-server-start /etc/kafka/broker.properties` |
 | `kafka-connect` | `connect-*` | `connect-distributed /etc/kafka/connect-distributed.properties` |
-| `kafka-rest` | `connect-2/3` | `kafka-rest-start /etc/kafka/kafka-rest.properties` |
+| `kafka-rest` | `connect-2/3` | `ExecStartPre=render-runtime-config.sh kafka-rest`, then `kafka-rest-start /run/kafka-rest/kafka-rest.properties` |
 | `kafka-exporter` | `connect-2/3` | `/opt/kafka-exporter/kafka_exporter --kafka.server=… --tls.* …` |
 | `prometheus` | `connect-2/3` | `/opt/prometheus/prometheus --config.file=… --storage.tsdb.*` |
 | `rhel-agent` | `ctrl-1` | `/usr/bin/python3 /opt/kafka-ops/scripts/rhel-agent.py` |
@@ -373,7 +374,7 @@ Bootstrap-only: `build-offline-bundle.sh`, `generate-certs.sh`, `distribute-cert
 6. **Ubuntu zone** (on `ctrl-2`): the same three scripts with `--zone ubuntu`, then `ops-sync.sh`.
 7. **Start:** `cluster-start.sh` (Connect waits) → `create-topics.sh` → `create-acls.sh` → start Connect → `health-check.sh`.
 8. **Connectors:** `connectors/create-all.sh`.
-9. **k8s and Grafana:** hand the `kafbat-ui` keystore/truststore to whoever runs Kafbat in k8s, check from a pod that `:29092` is reachable on every broker (DNS is confirmed), and add both Prometheus datasources to Grafana.
+9. **k8s and Grafana:** put the shared `k8s-clients` keystore/truststore into the k8s Secret(s) used by the apps and Kafbat, check from a pod that `:29092` is reachable on every broker (DNS is confirmed), and add both Prometheus datasources to Grafana.
 10. **Cutover:** repoint clients and the log service to the new cluster, then decommission Swarm.
 
 `setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, checks that every inventory host resolves in DNS (and stops if one doesn't), installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
@@ -537,7 +538,7 @@ All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the na
     ├── build-offline-bundle.sh  setup-node.sh  distribute-certs.sh  distribute-secrets.sh
     ├── cluster-start.sh  cluster-shutdown.sh  cluster-restart.sh  rolling-restart.sh
     ├── health-check.sh  get-logs.sh  create-topics.sh  create-acls.sh
-    ├── rotate-certs.sh  ops-sync.sh
+    ├── rotate-certs.sh  ops-sync.sh  render-runtime-config.sh
     └── connectors/ create-all.sh  restart-all.sh  delete-all.sh
 ```
 
@@ -553,5 +554,4 @@ All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the na
 6. **`rhel-agent`** is custom code with control over Rack 1. It needs code review and a security sign-off.
 7. **Static quorum:** changing the controller set later needs a planned migration to a dynamic quorum (KIP-853).
 8. **CA passphrase holders:** name the operators who know the CA passphrase (the key itself lives encrypted on `ctrl-2`/`ctrl-4`, §5.1).
-9. **REST Proxy `${file:}` support:** test on the chosen CP version. Fallback is inline passwords in a `0640` file (§5.2).
-10. **REST Proxy client auth:** decide whether the log service must present a client cert to REST Proxy (`ssl.client.auth`), or whether TLS server-side only is enough, as in the current setup.
+9. **Shared k8s client cert:** one principal for all k8s apps (§5.1). Accepted for now; revisit if per-app ACLs or auditing are needed.

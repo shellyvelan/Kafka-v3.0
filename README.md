@@ -237,7 +237,7 @@ SELinux stays **enforcing**. Since `/data` and `/opt/*` are non-default paths, `
 
 ### 5.4 Service users and systemd units
 
-**Users**, created by `setup-node.sh` with the **same UID/GID on every VM** (set in `inventory.conf`, default `1500`) so file ownership stays consistent across hosts and archives:
+**Users**, created by `setup-node.sh` with the **same UID/GID on every VM** (`kafka` = **1500**, confirmed free; set in `inventory.conf`) so file ownership stays consistent across hosts and archives. `setup-node.sh` stops if UID/GID 1500 already belongs to a different user or group, rather than silently picking another number:
 
 | User | Where | Purpose |
 | :--- | :--- | :--- |

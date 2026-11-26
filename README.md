@@ -70,7 +70,7 @@ listener.security.protocol.map=INTERNAL:SSL,EXTERNAL:SSL,CONTROLLER:SSL
 inter.broker.listener.name=INTERNAL
 controller.listener.names=CONTROLLER
 ```
-`EXTERNAL_HOST` is the broker's FQDN by default. **k8s pods must be able to resolve it.** Kafka clients connect to the bootstrap address and then to whatever each broker *advertises*, so if pods can't resolve `broker-N.<domain>`, clients fail after the first connection. Before cutover, check from a pod: `nslookup broker-1.<domain>`. If that fails, either add the brokers to corporate DNS or CoreDNS, or set `external_host` to the broker IP in `inventory.conf`. Broker certs carry both FQDN and IP SANs, so either choice works without reissuing certs.
+`EXTERNAL_HOST` is the broker's FQDN. **k8s pods resolve the broker FQDNs through DNS (confirmed)**, so k8s clients bootstrap on `broker-N.<domain>:29092` and follow the advertised names. Broker certs also carry IP SANs, so switching to IP advertising later wouldn't need new certs.
 
 `controller.quorum.voters=1@ctrl-1:9093,2@ctrl-2:9093,3@ctrl-3:9093,4@ctrl-4:9093,5@ctrl-5:9093` (static quorum; the voter set is fixed at format time).
 
@@ -365,7 +365,7 @@ Bootstrap-only: `build-offline-bundle.sh`, `generate-certs.sh`, `distribute-cert
 6. **Ubuntu zone** (on `ctrl-2`): the same three scripts with `--zone ubuntu`, then `ops-sync.sh`.
 7. **Start:** `cluster-start.sh` (Connect waits) → `create-topics.sh` → `create-acls.sh` → start Connect → `health-check.sh`.
 8. **Connectors:** `connectors/create-all.sh`.
-9. **k8s and Grafana:** hand the `kafbat-ui` keystore/truststore to whoever runs Kafbat in k8s, check from a pod that broker names resolve and `:29092` is reachable (§2.2), and add both Prometheus datasources to Grafana.
+9. **k8s and Grafana:** hand the `kafbat-ui` keystore/truststore to whoever runs Kafbat in k8s, check from a pod that `:29092` is reachable on every broker (DNS is confirmed), and add both Prometheus datasources to Grafana.
 10. **Cutover:** repoint clients and the log service to the new cluster, then decommission Swarm.
 
 `setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, checks that every inventory host resolves in DNS (and stops if one doesn't), installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
@@ -545,5 +545,4 @@ All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the na
 6. **`rhel-agent`** is custom code with control over Rack 1. It needs code review and a security sign-off.
 7. **Static quorum:** changing the controller set later needs a planned migration to a dynamic quorum (KIP-853).
 8. **CA key custody:** decide where the offline CA key lives and who can issue certs.
-9. **k8s → broker DNS:** unknown whether pods resolve `broker-N.<domain>`. Must be checked before cutover, with IPs as the fallback (§2.2).
-10. **REST Proxy config providers:** verify on the chosen CP version; until then its properties file holds the passwords (`0640`).
+9. **REST Proxy config providers:** verify on the chosen CP version; until then its properties file holds the passwords (`0640`).

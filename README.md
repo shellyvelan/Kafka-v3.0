@@ -106,7 +106,7 @@ connect-2    10.0.2.31   ubuntu  rack2  connect     -        3g    -
 | Prometheus | both exporters | `prometheus.yml` scrape targets |
 | Ops scripts | every host, zone and role | read the inventory directly (SSH for Ubuntu, agent for RHEL) |
 | `rhel-agent` | Rack 1 hosts and their services | copy of the inventory (Rack 1 rows only) |
-| Every VM | hostname → IP of all 17 VMs | DNS, or `/etc/hosts` generated from the inventory by `setup-node.sh` |
+| Every VM | hostname → IP of all 17 VMs | **Corporate DNS** (all 17 FQDNs). `health-check.sh` checks that forward and reverse lookups match the inventory. |
 
 **Changing the topology** (e.g. replacing a VM) means editing `inventory.conf`, re-rendering configs (`setup-node.sh --render-only`), and doing a rolling restart of the affected tiers.
 
@@ -368,7 +368,7 @@ Bootstrap-only: `build-offline-bundle.sh`, `generate-certs.sh`, `distribute-cert
 9. **k8s and Grafana:** hand the `kafbat-ui` keystore/truststore to whoever runs Kafbat in k8s, check from a pod that broker names resolve and `:29092` is reachable (§2.2), and add both Prometheus datasources to Grafana.
 10. **Cutover:** repoint clients and the log service to the new cluster, then decommission Swarm.
 
-`setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, generates `/etc/hosts` if DNS isn't used, installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
+`setup-node.sh` installs OS packages from the bundle, creates the users and directories (§5.4), unpacks the binaries (and the exporter binary on `connect-2/3`), renders configs from `inventory.conf`, checks that every inventory host resolves in DNS (and stops if one doesn't), installs and enables units, configures journald limits, sets OS tuning (`vm.swappiness=1`, `nofile` ≥ 100000, `vm.max_map_count`), applies SELinux contexts on RHEL, and runs `kafka-storage format` on controllers and brokers. Formatting is skipped if `meta.properties` already exists.
 
 ### 8.2 REST Proxy failover
 1. Confirm `connect-2`'s REST Proxy is down: `health-check.sh`.
@@ -490,7 +490,7 @@ Kafka 4.x reads only Log4j2 (`log4j2.yaml`); Log4j 1.x configs from 3.9 don't wo
 | 22 | within the Ubuntu zone (ops nodes → all Ubuntu VMs, `ctrl-2` ↔ `ctrl-4`); within the RHEL zone (`ctrl-1` → RHEL VMs) | SSH |
 | 27017 | Connect VMs → MongoDB | Connector traffic |
 
-All 17 VMs must resolve each other by hostname (DNS or `/etc/hosts` generated from the inventory), and the names must match the cert SANs. k8s pods must resolve the brokers' `external_host` names (§2.2).
+All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the names must match the cert SANs. k8s pods must resolve the brokers' `external_host` names (§2.2).
 
 ---
 

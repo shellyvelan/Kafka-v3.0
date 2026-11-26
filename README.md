@@ -57,7 +57,7 @@ Off-VM (all existing, not managed by this repo): **Kafbat UI** (k8s), **k8s apps
 | Brokers `broker-1..9` | `101..109` | `INTERNAL` (mTLS): inter-broker **and** VM-side clients (Connect, REST, exporter, ops scripts) | 9092 |
 | | | `EXTERNAL` (mTLS): clients in **k8s** (apps, Kafbat UI) | 29092 |
 | Connect workers | — | REST API (HTTPS) | 8083 |
-| REST Proxy | — | HTTP API | 8082 |
+| REST Proxy | — | **HTTPS** API (own server keystore) | 8082 |
 | kafka_exporter | — | `/metrics` | 9308 |
 | Prometheus | — | HTTP | 9090 |
 | `rhel-agent` | — | HTTPS API | 6000 |
@@ -160,7 +160,11 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 * Connect REST API on **8083 over HTTPS** (cluster CA). The ops node and Kafbat UI (from k8s) call it.
 
 ### 4.4 REST Proxy (2 instances)
-* Runs on `connect-2` and `connect-3`, port **8082**, and talks to brokers on 9092. Its only consumer is the internal **log service in Kubernetes**, which calls `rest.kafka.<domain>:8082`.
+* Runs on `connect-2` and `connect-3`, port **8082**, and talks to brokers on 9092. Its only consumer is the internal **log service in Kubernetes**, which calls `https://rest.kafka.<domain>:8082`.
+* **Two TLS sides, as in the current Swarm setup:**
+  * **Server side** (`ssl.keystore.*`): REST Proxy's own HTTPS listener that the log service connects to. Cert SANs include `rest.kafka.<domain>` **and** both VM names, so the DNS failover in §8.2 doesn't break TLS.
+  * **Client side** (`client.ssl.keystore.*` / `client.ssl.truststore.*`): REST Proxy's mTLS identity towards the brokers (`CN=kafka-rest`).
+  * Both use the same per-host keystore (one cert with the role CN plus the extra SANs), so the paths match the Swarm env vars `KAFKA_REST_SSL_KEYSTORE_LOCATION`, `KAFKA_REST_CLIENT_SSL_KEYSTORE_LOCATION` and `KAFKA_REST_CLIENT_SSL_TRUSTSTORE_LOCATION`. The log service needs the **cluster CA** in its truststore.
 * **Failover is manual:** the DNS name points at `connect-2`; if it fails, repoint it to `connect-3`. This is documented in §8.
 * The REST Proxy authenticates to brokers as its own principal (`User:kafka-rest`), so ACLs for everything the log service does are granted to that principal.
 * ⚠️ If the log service uses **v2 consumer instances**, those are stateful per proxy instance and are lost on failover. The service must recreate its consumer instance on errors. Producing (v2/v3) is stateless.
@@ -201,7 +205,11 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 * `ssl.principal.mapping.rules=RULE:^CN=([^,]+).*$/$1/,DEFAULT`
 * `super.users=User:kafka-broker;User:kafka-controller;User:kafka-admin`
 * `allow.everyone.if.no.acl.found=false`
-* Certificates have a fixed validity period; `rotate-certs.sh` re-issues them and does a rolling restart (see §7).
+* **Validity:** CA **10 years**, host and client certs **5 years**. `health-check.sh` warns 90 days before any cert expires, and `rotate-certs.sh` re-issues certs and does a rolling restart (§7).
+* **CA private key (`ca.key`):** anyone who has it can create a cert for any name, including `kafka-admin` (super user), so it is the most sensitive file in the setup.
+  * Stored on **`ctrl-2`** in `certs/ca/`, **encrypted with a passphrase** (AES-256). It is never stored unencrypted on disk, and the passphrase is never written to a file. Operators type it only when `generate-certs.sh` / `rotate-certs.sh` issue certs.
+  * `ops-sync.sh` copies the **encrypted** key to `ctrl-4`, so the secondary ops node can issue certs too. The key is never distributed to any other VM.
+  * The passphrase is known to named operators only and kept in your password manager or vault.
 
 ### 5.2 Secrets: lifecycle
 
@@ -226,7 +234,7 @@ Sizing is unknown at design time; heaps and retention are inventory variables an
 | :--- | :--- |
 | Brokers, controllers, Connect workers | `FileConfigProvider`: `ssl.keystore.password=${file:/etc/kafka/secrets/credentials.properties:ssl.keystore.password}` |
 | MongoDB connectors | `FileConfigProvider` in the connector JSON (`${file:...:mongo.uri}`). The URI never lands in the `connect-configs` topic, because only the placeholder is stored there. |
-| REST Proxy | Its properties are rendered with passwords at install time into `/etc/kafka/kafka-rest.properties` (`root:kafka 0640`). Whether CP REST Proxy resolves config providers still needs to be **verified on the CP version**. If it does, we switch to placeholders. |
+| REST Proxy | In Swarm, the Confluent image built the properties file from `KAFKA_REST_*` env vars. On VMs, `setup-node.sh` renders `/etc/kafka/kafka-rest.properties` directly: keystore/truststore **locations** as paths, and the **passwords** for both the server and client keystores. Whether REST Proxy resolves `${file:…}` placeholders still needs to be **tested on the CP version**. If it does, the passwords become placeholders. If not, they stay inline in this file, which is `root:kafka 0640`. |
 | kafka_exporter | PEM key file path in its flags. No password, since the key is unencrypted and protected by file permissions. |
 | `rhel-agent` and ops scripts | `AGENT_API_TOKEN` from `service.env` (systemd `EnvironmentFile=` for the agent; sourced by scripts) |
 
@@ -483,7 +491,7 @@ Kafka 4.x reads only Log4j2 (`log4j2.yaml`); Log4j 1.x configs from 3.9 don't wo
 | 9092 | brokers ↔ brokers; Connect VMs, `ctrl-2`, `ctrl-4` → brokers | `INTERNAL`: inter-broker + VM-side clients (mTLS) |
 | 29092 | **k8s** (apps, Kafbat UI) → brokers | `EXTERNAL`: k8s clients (mTLS) |
 | 8083 | ops nodes, connect ↔ connect, **k8s (Kafbat)** → Connect VMs | Connect REST (HTTPS) |
-| 8082 | **k8s (log service)** → `connect-2`, `connect-3` | REST Proxy |
+| 8082 | **k8s (log service)** → `connect-2`, `connect-3` | REST Proxy (HTTPS) |
 | 9308 | Prometheus → exporters (`connect-2`, `connect-3`) | Exporter metrics |
 | 9090 | Grafana → `connect-2`, `connect-3` | Prometheus |
 | 6000 | **`ctrl-2`, `ctrl-4` → `ctrl-1` only** | `rhel-agent` (HTTPS) |
@@ -544,5 +552,6 @@ All 17 VMs must resolve each other by FQDN through **corporate DNS**, and the na
 5. **REST Proxy failover** is manual, and v2 consumer state is lost on failover (§4.4).
 6. **`rhel-agent`** is custom code with control over Rack 1. It needs code review and a security sign-off.
 7. **Static quorum:** changing the controller set later needs a planned migration to a dynamic quorum (KIP-853).
-8. **CA key custody:** decide where the offline CA key lives and who can issue certs.
-9. **REST Proxy config providers:** verify on the chosen CP version; until then its properties file holds the passwords (`0640`).
+8. **CA passphrase holders:** name the operators who know the CA passphrase (the key itself lives encrypted on `ctrl-2`/`ctrl-4`, §5.1).
+9. **REST Proxy `${file:}` support:** test on the chosen CP version. Fallback is inline passwords in a `0640` file (§5.2).
+10. **REST Proxy client auth:** decide whether the log service must present a client cert to REST Proxy (`ssl.client.auth`), or whether TLS server-side only is enough, as in the current setup.
